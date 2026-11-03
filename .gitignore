@@ -1,0 +1,16 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+.spotify_cache
+google_credentials.json
+google_token.json
+credentials.json
+token.json
+memory.db
+*.db
+
+# Lokalne kopije projekta sadrže .env i tokene.
+Backup/
+Backup2/
+*.zip
