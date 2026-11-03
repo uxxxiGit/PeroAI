@@ -1,17 +1,13 @@
 import os
 import re
 import json
-import math
-import random
 import sqlite3
 import asyncio
 from datetime import datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-import spotipy
 from dotenv import load_dotenv
 from openai import OpenAI
-from spotipy.oauth2 import SpotifyOAuth
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -26,6 +22,7 @@ from telegram.ext import (
 
 import calendar_service
 import rijeka_news_service
+import spotify_service
 import stripovi_forum_service
 import tasks_service
 
@@ -39,17 +36,13 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_ALLOWED_USER_ID = os.getenv("TELEGRAM_ALLOWED_USER_ID", "").strip()
 
-SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID")
-SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET")
-SPOTIFY_REDIRECT_URI = os.getenv("SPOTIFY_REDIRECT_URI")
-
 
 # =========================================================
 # CONFIG
 # =========================================================
 
 DB_FILE = "memory.db"
-BOT_VERSION = "2026.11.03-history-v10"
+BOT_VERSION = "2026.11.03-spotify-v11"
 
 # Kratka neposredna povijest. Trajna memorija se dohvaća odvojeno i samo kada
 # je povezana s aktualnim pitanjem, kako se nepotrebno ne troše tokeni.
@@ -89,23 +82,9 @@ STRIPOVI_FORUM_MODEL = os.getenv("STRIPOVI_FORUM_MODEL", SMART_MODEL)
 STRIPOVI_FORUM_HOUR = 8
 STRIPOVI_FORUM_MINUTE = 40
 
-HISTORY_SYNC_MINUTES = 10
-LAST_HISTORY_SYNC = None
-
 # Spotify vraća samo zadnjih 50 slušanja (~2,5 h), pa se povijest mora
 # dohvaćati u pozadini, neovisno o tome piše li korisnik botu.
 HISTORY_BACKGROUND_SYNC_MINUTES = 20
-
-# Discovery:
-DISCOVERY_CANDIDATE_COUNT = 20
-
-# Ako imaš >= ovoliko Liked Songs određenog izvođača,
-# Discovery ga smatra "poznatim / omiljenim".
-DISCOVERY_LIKED_THRESHOLD = 2
-
-# Spotify nakon pauziranja ponekad privremeno prestane vraćati uređaj kroz
-# Connect API. Zato tijekom rada bota pamtimo zadnji uređaj na kojem je sviralo.
-LAST_SPOTIFY_DEVICE = None
 
 
 # =========================================================
@@ -120,9 +99,8 @@ client = OpenAI(
 SYSTEM_PROMPT = """
 Ti si korisnikov osobni AI agent za Spotify, Google Calendar i Google Tasks.
 
-Odgovaraj kratko, prirodno i na hrvatskom.
-
-Za Spotify radnje koristi alate.
+Odgovaraj kratko, prirodno i na hrvatskom. Ne završavaj odgovor ponudama
+tipa "Želiš li još...", "Mogu i...". Odgovori i stani.
 
 GOOGLE CALENDAR:
 
@@ -162,184 +140,44 @@ tiho spremljenoj automatskoj memoriji, osim ako te pita što pamtiš. Ako korisn
 pita što pamtiš, upotrijebi memory_list. Kod promjene istog podatka uvijek
 prepiši staru vrijednost novom.
 
-DISCOVERY:
+SPOTIFY:
 
-Ako korisnik želi izvođače slične nekom izvođaču,
-koristi spotify_discover_artists_v2.
+Spotify radnje izvrši ODMAH pozivom alata. Nikad ne traži potvrdu za Spotify
+i ne postavljaj dodatna pitanja kad se zahtjev razumije. Ne pitaj za ime
+playliste (smisli kratko ime), javnost (uvijek privatna) ni redoslijed
+(zadrži korisnikov). Pitaj samo ako uopće nije jasno koju glazbu korisnik želi.
+Ako korisnik napiše ime s tipfelerom ("fontained dc"), pošalji ga takvog;
+alat sam pronalazi pravog izvođača.
 
-VAŽNO:
-Nemoj sam zaključivati da izvođač nije među korisnikovim
-favoritima. Python alat to provjerava preko Spotify artist_id.
+Koji alat:
+- "playlista od 20 pjesama Fontaines D.C." / "playlista s Majke i KUD Idijoti,
+  po 10 pjesama" → spotify_playlist_from_artists. U playlisti su SAMO pjesme
+  navedenih izvođača. Ako je zadan ukupan broj za više izvođača, podijeli ga
+  ravnomjerno.
+- korisnik pošalje popis pjesama → spotify_playlist_from_tracks, svaku pjesmu
+  kao "Izvođač - Naslov", istim redom.
+- "dodaj X u playlistu Y" → spotify_add_to_playlist.
+- "izvođači slični X", "bendovi kao X koje ne slušam", discovery →
+  spotify_similar_artists. Sam predloži 15-25 stilski srodnih kandidata
+  (bez X). Seed izvođač NIJE u rezultatu. only_new=true kad korisnik traži
+  nove/nepoznate izvođače. create_playlist=true samo kad traži playlistu.
+- playlista iz Liked Songs / "mojih pjesama" po žanru, raspoloženju, domaćem
+  → spotify_playlist_from_liked. "uglavnom punk, malo post-punka" →
+  genres=[punk 5, post-punk 2]. Žanrovi na engleskom, malim slovima.
+- "što sam slušao jučer/danas/u subotu" → spotify_history_list;
+  "napravi playlistu od onog što sam slušao jučer" → isti alat s
+  create_playlist=true; "što/koga sam najviše slušao" → spotify_history_stats.
+  Datumi su lokalni (Europe/Zagreb), YYYY-MM-DD.
+- "pusti X" → spotify_play (kind: track, artist, album ili playlist).
+- "stavi u red" → spotify_add_to_queue s popisom pjesama.
+- top pjesme/izvođači sa Spotifyja → spotify_top. short_term ≈ 4 tjedna,
+  medium_term ≈ 6 mjeseci, long_term = dugoročno.
 
-Kada koristiš spotify_discover_artists_v2:
-
-- candidate_artists mora sadržavati 15-25 kandidata
-- nemoj uključiti seed artist u candidate_artists
-- artist_count je broj koji korisnik želi
-- tracks_per_artist je broj pjesama svakog izvođača
-- exclude_favorites=true ako korisnik kaže:
-  "koje ne slušam", "koje nemam", "novi bendovi",
-  "nisu među favoritima", "discovery"
-- exclude_top_artists=true za discovery
-- min_liked_tracks_to_exclude koristi 2 po defaultu
-
-Primjer:
-
-"Daj mi 5 bendova kao Fontaines D.C. koje ne slušam
-i dvije pjesme svakog"
-
-→ seed_artist="Fontaines D.C."
-→ candidate_artists=[oko 20 stilistički srodnih izvođača]
-→ artist_count=5
-→ tracks_per_artist=2
-→ exclude_favorites=true
-→ exclude_top_artists=true
-→ min_liked_tracks_to_exclude=2
-
-Ako korisnik traži playlistu discovery rezultata:
-create_playlist=true.
-
-SMART PLAYLIST V3:
-
-Za zahtjeve iz korisnikovih Liked Songs sa soft kriterijima
-koristi spotify_create_smart_playlist_v3.
-
-Primjer:
-"uglavnom punk, nešto post-punka, preferiraj domaće"
-→ genres punk weight 5, post-punk weight 3
-→ domestic_weight > 0
-
-Za precizne datume koristi lokalnu listening history bazu:
-- "što sam slušao jučer/danas/u subotu" → spotify_history_list
-- "napravi playlistu od onog što sam slušao jučer" →
-  spotify_history_list s create_playlist=true
-- "što sam najviše slušao ovaj tjedan" → spotify_history_stats
-Datumi su lokalni (Europe/Zagreb) u obliku YYYY-MM-DD.
-
-Spotify Top Items:
-short_term = približno zadnja 4 tjedna
-medium_term = približno 6 mjeseci
-long_term = dugoročne preference
+Kad alat napravi playlistu, odgovori imenom, brojem pjesama i linkom, te
+navedi što nije pronađeno. Nemoj nabrajati sve pjesme.
 
 Nikad ne tvrdi da je radnja uspjela prije rezultata alata.
 """
-
-
-# =========================================================
-# SPOTIFY
-# =========================================================
-
-spotify = spotipy.Spotify(
-    auth_manager=SpotifyOAuth(
-        client_id=SPOTIFY_CLIENT_ID,
-        client_secret=SPOTIFY_CLIENT_SECRET,
-        redirect_uri=SPOTIFY_REDIRECT_URI,
-        scope=(
-            "user-read-playback-state "
-            "user-modify-playback-state "
-            "user-read-currently-playing "
-            "user-read-recently-played "
-            "user-top-read "
-            "user-library-read "
-            "user-library-modify "
-            "playlist-modify-private "
-            "playlist-modify-public "
-            "playlist-read-private "
-            "user-read-private"
-        ),
-        cache_path=".spotify_cache",
-    )
-)
-
-
-# =========================================================
-# DOMAĆI / REGIONALNI
-# =========================================================
-
-DOMESTIC_ARTISTS = [
-    "hladno pivo",
-    "prljavo kazalište",
-    "parni valjak",
-    "azra",
-    "haustor",
-    "film",
-    "psihomodo pop",
-    "majke",
-    "let 3",
-    "pips chips & videoclips",
-    "elemental",
-    "tbf",
-    "gibonni",
-    "oliver dragojević",
-    "darko rundek",
-    "aerodrom",
-    "daleka obala",
-    "vatra",
-    "silente",
-    "brkovi",
-    "kud idijoti",
-    "term iti",
-    "pankrti",
-    "buldožer",
-    "idoli",
-    "električni orgazam",
-    "partibrejkers",
-    "disciplina kičme",
-    "ekatarina velika",
-    "plavi orkestar",
-    "zabranjeno pušenje",
-    "bijelo dugme",
-    "debeli precjednik",
-    "mašinko",
-    "fakofbolan",
-]
-
-
-GENRE_KEYWORDS = {
-    "punk": [
-        "punk",
-        "punk rock",
-        "hardcore",
-        "hardcore punk",
-        "garage punk",
-        "pop punk",
-    ],
-
-    "post-punk": [
-        "post-punk",
-        "post punk",
-        "gothic rock",
-        "dark wave",
-        "darkwave",
-        "cold wave",
-    ],
-
-    "rock": [
-        "rock",
-        "alternative rock",
-        "indie rock",
-        "garage rock",
-        "hard rock",
-    ],
-
-    "metal": [
-        "metal",
-        "heavy metal",
-        "thrash",
-        "doom",
-        "death metal",
-        "black metal",
-    ],
-
-    "electronic": [
-        "electronic",
-        "electronica",
-        "techno",
-        "house",
-        "ambient",
-        "synth",
-    ],
-}
 
 
 # =========================================================
@@ -990,2088 +828,6 @@ def clear_messages(user_id):
 
 
 # =========================================================
-# HISTORY
-# =========================================================
-
-def save_history_track(track, played_at):
-
-    if not track or not played_at:
-        return
-
-    artists = track.get("artists", [])
-
-    artist = (
-        artists[0]
-        if artists
-        else {}
-    )
-
-    conn = sqlite3.connect(DB_FILE)
-
-    conn.execute(
-        """
-        INSERT OR IGNORE INTO listening_history (
-            track_id,
-            track_uri,
-            track_name,
-            artist_name,
-            artist_id,
-            album_name,
-            played_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            track.get("id"),
-            track.get("uri"),
-            track.get("name", ""),
-            artist.get("name", ""),
-            artist.get("id"),
-            track.get(
-                "album",
-                {}
-            ).get(
-                "name",
-                ""
-            ),
-            played_at,
-        ),
-    )
-
-    conn.commit()
-    conn.close()
-
-
-def spotify_sync_history():
-
-    try:
-
-        result = spotify.current_user_recently_played(
-            limit=50
-        )
-
-        count = 0
-
-        for item in result.get(
-            "items",
-            []
-        ):
-
-            track = item.get("track")
-            played_at = item.get("played_at")
-
-            if track and played_at:
-
-                save_history_track(
-                    track,
-                    played_at
-                )
-
-                count += 1
-
-        return (
-            f"Provjereno {count} nedavnih slušanja."
-        )
-
-    except Exception as e:
-
-        return (
-            f"History sync nije uspio: {e}"
-        )
-
-
-def sync_history_if_needed():
-
-    global LAST_HISTORY_SYNC
-
-    now = datetime.now(
-        timezone.utc
-    )
-
-    if LAST_HISTORY_SYNC is None:
-
-        spotify_sync_history()
-
-        LAST_HISTORY_SYNC = now
-
-        return
-
-    elapsed = (
-        now - LAST_HISTORY_SYNC
-    ).total_seconds()
-
-    if elapsed >= HISTORY_SYNC_MINUTES * 60:
-
-        spotify_sync_history()
-
-        LAST_HISTORY_SYNC = now
-
-
-def get_all_play_counts():
-
-    conn = sqlite3.connect(DB_FILE)
-
-    rows = conn.execute(
-        """
-        SELECT track_id, COUNT(*)
-        FROM listening_history
-        WHERE track_id IS NOT NULL
-        GROUP BY track_id
-        """
-    ).fetchall()
-
-    conn.close()
-
-    return dict(rows)
-
-
-def get_recent_play_counts(days=30):
-
-    cutoff = (
-        datetime.now(timezone.utc)
-        - timedelta(days=int(days))
-    ).isoformat()
-
-    conn = sqlite3.connect(DB_FILE)
-
-    rows = conn.execute(
-        """
-        SELECT track_id, COUNT(*)
-        FROM listening_history
-        WHERE track_id IS NOT NULL
-          AND played_at >= ?
-        GROUP BY track_id
-        """,
-        (cutoff,),
-    ).fetchall()
-
-    conn.close()
-
-    return dict(rows)
-
-
-def get_last_play_dates():
-
-    conn = sqlite3.connect(DB_FILE)
-
-    rows = conn.execute(
-        """
-        SELECT track_id, MAX(played_at)
-        FROM listening_history
-        WHERE track_id IS NOT NULL
-        GROUP BY track_id
-        """
-    ).fetchall()
-
-    conn.close()
-
-    return dict(rows)
-
-
-def days_since_played(value):
-
-    if not value:
-        return 9999
-
-    try:
-
-        dt = datetime.fromisoformat(
-            value.replace(
-                "Z",
-                "+00:00"
-            )
-        )
-
-        return (
-            datetime.now(timezone.utc)
-            - dt
-        ).days
-
-    except Exception:
-
-        return 9999
-
-
-# =========================================================
-# DEVICES + PLAYER
-# =========================================================
-
-def remember_spotify_device(device):
-    global LAST_SPOTIFY_DEVICE
-
-    if device and device.get("id"):
-        LAST_SPOTIFY_DEVICE = {
-            "id": device["id"],
-            "name": device.get("name", "Spotify uređaj"),
-        }
-
-
-def get_last_spotify_device():
-    return LAST_SPOTIFY_DEVICE
-
-def get_spotify_device():
-
-    try:
-
-        devices = spotify.devices().get(
-            "devices",
-            []
-        )
-
-        if not devices:
-            return None
-
-        for device in devices:
-
-            if device.get("is_active"):
-                remember_spotify_device(device)
-                return device
-
-        remember_spotify_device(devices[0])
-        return devices[0]
-
-    except Exception:
-
-        return None
-
-
-def spotify_devices():
-
-    try:
-
-        devices = spotify.devices().get(
-            "devices",
-            []
-        )
-
-        if not devices:
-            return "Ne vidim Spotify uređaje."
-
-        return "\n".join(
-            (
-                f"• {d['name']} "
-                f"({d['type']}, "
-                f"{'aktivni' if d.get('is_active') else 'neaktivan'})"
-            )
-            for d in devices
-        )
-
-    except Exception as e:
-
-        return f"Device greška: {e}"
-
-
-def spotify_current_track():
-
-    try:
-
-        current = spotify.current_playback()
-
-        if not current or not current.get("item"):
-
-            return "Trenutno ništa ne svira."
-
-        track = current["item"]
-
-        artists = ", ".join(
-            a["name"]
-            for a in track.get(
-                "artists",
-                []
-            )
-        )
-
-        return (
-            f"{artists} - {track['name']}"
-        )
-
-    except Exception as e:
-
-        return f"Spotify greška: {e}"
-
-
-def spotify_pause():
-
-    try:
-
-        playback = spotify.current_playback()
-        device = playback.get("device") if playback else None
-        remember_spotify_device(device)
-
-        spotify.pause_playback(
-            device_id=device.get("id") if device else None
-        )
-
-        return "Spotify pauziran."
-
-    except Exception as e:
-
-        return f"Pause greška: {e}"
-
-
-def spotify_resume():
-
-    try:
-
-        device = get_spotify_device() or get_last_spotify_device()
-
-        if not device:
-
-            return (
-                "Ne vidim Spotify uređaj. Otvori Spotify na željenom uređaju "
-                "i pokušaj ponovno."
-            )
-
-        spotify.start_playback(
-            device_id=device["id"]
-        )
-
-        return (
-            f"Nastavljam na {device['name']}."
-        )
-
-    except Exception as e:
-
-        return f"Resume greška: {e}"
-
-
-def spotify_next():
-
-    try:
-
-        spotify.next_track()
-
-        return "Sljedeća pjesma."
-
-    except Exception as e:
-
-        return f"Next greška: {e}"
-
-
-def spotify_previous():
-
-    try:
-
-        spotify.previous_track()
-
-        return "Prethodna pjesma."
-
-    except Exception as e:
-
-        return f"Previous greška: {e}"
-
-
-def spotify_set_volume(percent):
-
-    try:
-
-        percent = max(
-            0,
-            min(int(percent), 100)
-        )
-
-        spotify.volume(percent)
-
-        return f"Glasnoća {percent}%."
-
-    except Exception as e:
-
-        return f"Volume greška: {e}"
-
-
-def spotify_shuffle(enabled):
-
-    try:
-
-        spotify.shuffle(
-            bool(enabled)
-        )
-
-        return (
-            "Shuffle uključen."
-            if enabled
-            else "Shuffle isključen."
-        )
-
-    except Exception as e:
-
-        return f"Shuffle greška: {e}"
-
-
-def spotify_repeat(mode):
-
-    try:
-
-        if mode not in [
-            "track",
-            "context",
-            "off",
-        ]:
-
-            mode = "off"
-
-        spotify.repeat(mode)
-
-        return f"Repeat: {mode}."
-
-    except Exception as e:
-
-        return f"Repeat greška: {e}"
-
-
-# =========================================================
-# SEARCH
-# =========================================================
-
-def normalize_name(name):
-
-    return (
-        name
-        .lower()
-        .strip()
-        .replace("’", "'")
-    )
-
-
-def spotify_find_artist(artist_name):
-
-    try:
-
-        result = spotify.search(
-            q=f'artist:"{artist_name}"',
-            type="artist",
-            limit=10,
-        )
-
-        artists = (
-            result
-            .get("artists", {})
-            .get("items", [])
-        )
-
-        if not artists:
-            return None
-
-        target = normalize_name(
-            artist_name
-        )
-
-        # Prefer exact match.
-        for artist in artists:
-
-            if normalize_name(
-                artist.get(
-                    "name",
-                    ""
-                )
-            ) == target:
-
-                return artist
-
-        # Fallback na prvi Spotify rezultat.
-        return artists[0]
-
-    except Exception as e:
-
-        print(
-            "Artist search:",
-            e
-        )
-
-        return None
-
-
-def spotify_search_track(query):
-
-    try:
-
-        result = spotify.search(
-            q=query,
-            type="track",
-            limit=10,
-        )
-
-        tracks = (
-            result
-            .get("tracks", {})
-            .get("items", [])
-        )
-
-        return (
-            tracks[0]
-            if tracks
-            else None
-        )
-
-    except Exception:
-
-        return None
-
-
-def spotify_search_and_play(query):
-
-    try:
-
-        track = spotify_search_track(
-            query
-        )
-
-        if not track:
-
-            return f"Nisam pronašao {query}."
-
-        device = get_spotify_device()
-
-        if not device:
-
-            return (
-                "Otvori Spotify na nekom uređaju."
-            )
-
-        remember_spotify_device(device)
-
-        spotify.start_playback(
-            device_id=device["id"],
-            uris=[
-                track["uri"]
-            ],
-        )
-
-        artists = ", ".join(
-            a["name"]
-            for a in track["artists"]
-        )
-
-        return (
-            f"Puštam {artists} - {track['name']}."
-        )
-
-    except Exception as e:
-
-        return f"Play greška: {e}"
-
-
-# =========================================================
-# TRACKS FOR DISCOVERY ARTIST
-# =========================================================
-
-def spotify_tracks_for_artist(
-    artist,
-    count=2
-):
-    """
-    Artist Top Tracks endpoint više nije pouzdan
-    za Development Mode, zato koristimo Search.
-
-    Rezultat filtriramo po stvarnom Spotify artist_id.
-    """
-
-    artist_id = artist.get("id")
-    artist_name = artist.get("name", "")
-
-    if not artist_id:
-        return []
-
-    wanted = max(
-        1,
-        min(int(count), 5)
-    )
-
-    found = []
-
-    seen_track_ids = set()
-    seen_names = set()
-
-    # Search max limit je 10.
-    # Probamo nekoliko stranica.
-    for offset in [
-        0,
-        10,
-        20,
-    ]:
-
-        try:
-
-            result = spotify.search(
-                q=f'artist:"{artist_name}"',
-                type="track",
-                limit=10,
-                offset=offset,
-            )
-
-        except Exception:
-
-            continue
-
-        tracks = (
-            result
-            .get("tracks", {})
-            .get("items", [])
-        )
-
-        for track in tracks:
-
-            track_id = track.get("id")
-
-            if not track_id:
-                continue
-
-            artist_ids = {
-                a.get("id")
-                for a in track.get(
-                    "artists",
-                    []
-                )
-            }
-
-            # HARD validation:
-            # pjesma stvarno mora pripadati izvođaču.
-            if artist_id not in artist_ids:
-                continue
-
-            normalized_track = normalize_name(
-                track.get(
-                    "name",
-                    ""
-                )
-            )
-
-            # Izbaci duplikate singlova/album verzija
-            # istog naziva.
-            if (
-                track_id in seen_track_ids
-                or normalized_track in seen_names
-            ):
-                continue
-
-            seen_track_ids.add(
-                track_id
-            )
-
-            seen_names.add(
-                normalized_track
-            )
-
-            found.append(
-                track
-            )
-
-            if len(found) >= wanted:
-                return found
-
-    return found
-
-
-# =========================================================
-# QUEUE
-# =========================================================
-
-def spotify_get_queue(limit=10):
-
-    try:
-
-        queue = spotify.queue().get(
-            "queue",
-            []
-        )
-
-        if not queue:
-            return "Queue je prazan."
-
-        lines = []
-
-        for i, track in enumerate(
-            queue[:int(limit)],
-            1
-        ):
-
-            artists = ", ".join(
-                a["name"]
-                for a in track.get(
-                    "artists",
-                    []
-                )
-            )
-
-            lines.append(
-                f"{i}. {artists} - {track['name']}"
-            )
-
-        return "\n".join(lines)
-
-    except Exception as e:
-
-        return f"Queue greška: {e}"
-
-
-def spotify_add_to_queue(query):
-
-    try:
-
-        track = spotify_search_track(
-            query
-        )
-
-        if not track:
-
-            return (
-                f"Nisam pronašao {query}."
-            )
-
-        spotify.add_to_queue(
-            track["uri"]
-        )
-
-        return (
-            f"Dodano u queue: {track['name']}."
-        )
-
-    except Exception as e:
-
-        return f"Queue greška: {e}"
-
-
-# =========================================================
-# LIKED SONGS
-# =========================================================
-
-def spotify_get_liked_tracks(
-    max_tracks=2000
-):
-
-    tracks = []
-
-    offset = 0
-
-    try:
-
-        while len(tracks) < max_tracks:
-
-            result = (
-                spotify
-                .current_user_saved_tracks(
-                    limit=50,
-                    offset=offset,
-                )
-            )
-
-            items = result.get(
-                "items",
-                []
-            )
-
-            if not items:
-                break
-
-            for item in items:
-
-                track = item.get("track")
-
-                if not track:
-                    continue
-
-                artists = track.get(
-                    "artists",
-                    []
-                )
-
-                tracks.append(
-                    {
-                        "id": track.get("id"),
-                        "uri": track.get("uri"),
-                        "name": track.get(
-                            "name",
-                            ""
-                        ),
-                        "artist": (
-                            artists[0]["name"]
-                            if artists
-                            else ""
-                        ),
-                        "artist_id": (
-                            artists[0]["id"]
-                            if artists
-                            else None
-                        ),
-                    }
-                )
-
-                if len(tracks) >= max_tracks:
-                    break
-
-            if not result.get("next"):
-                break
-
-            offset += 50
-
-        return tracks
-
-    except Exception as e:
-
-        print(
-            "Liked Songs:",
-            e
-        )
-
-        return []
-
-
-def spotify_list_liked(limit=20):
-
-    tracks = spotify_get_liked_tracks(
-        max_tracks=min(
-            int(limit),
-            100
-        )
-    )
-
-    if not tracks:
-        return "Nema Liked Songs."
-
-    return "\n".join(
-        (
-            f"{i}. {t['artist']} - "
-            f"{t['name']}"
-        )
-        for i, t in enumerate(
-            tracks,
-            1
-        )
-    )
-
-
-# =========================================================
-# DISCOVERY FAVORITES CACHE
-# =========================================================
-
-def get_liked_artist_counts():
-
-    counts = {}
-
-    for track in spotify_get_liked_tracks(
-        max_tracks=2000
-    ):
-
-        artist_id = track.get(
-            "artist_id"
-        )
-
-        if not artist_id:
-            continue
-
-        counts[artist_id] = (
-            counts.get(
-                artist_id,
-                0
-            )
-            + 1
-        )
-
-    return counts
-
-
-def get_top_artist_ids():
-
-    result_ids = set()
-
-    for time_range in [
-        "short_term",
-        "medium_term",
-        "long_term",
-    ]:
-
-        try:
-
-            result = (
-                spotify
-                .current_user_top_artists(
-                    limit=50,
-                    time_range=time_range,
-                )
-            )
-
-            for artist in result.get(
-                "items",
-                []
-            ):
-
-                artist_id = artist.get(
-                    "id"
-                )
-
-                if artist_id:
-
-                    result_ids.add(
-                        artist_id
-                    )
-
-        except Exception as e:
-
-            print(
-                "Top artist discovery filter:",
-                e
-            )
-
-    return result_ids
-
-
-# =========================================================
-# DISCOVERY V2
-# =========================================================
-
-def spotify_discover_artists_v2(
-    seed_artist,
-    candidate_artists,
-    artist_count=5,
-    tracks_per_artist=2,
-    exclude_favorites=True,
-    exclude_top_artists=True,
-    min_liked_tracks_to_exclude=2,
-    create_discovery_playlist=False,
-    playlist_name=None,
-):
-    """
-    GPT daje candidate_artists.
-    Python odlučuje koji su stvarno novi.
-
-    HARD FILTER radi po Spotify artist_id.
-    """
-
-    try:
-
-        artist_count = max(
-            1,
-            min(
-                int(artist_count),
-                10
-            )
-        )
-
-        tracks_per_artist = max(
-            1,
-            min(
-                int(tracks_per_artist),
-                5
-            )
-        )
-
-        min_liked_tracks_to_exclude = max(
-            1,
-            int(
-                min_liked_tracks_to_exclude
-            )
-        )
-
-        # ---------------------------------------------
-        # RESOLVE SEED
-        # ---------------------------------------------
-
-        seed = spotify_find_artist(
-            seed_artist
-        )
-
-        seed_id = (
-            seed.get("id")
-            if seed
-            else None
-        )
-
-        # ---------------------------------------------
-        # BUILD HARD BLACKLIST
-        # ---------------------------------------------
-
-        liked_counts = {}
-
-        top_artist_ids = set()
-
-        if exclude_favorites:
-
-            liked_counts = (
-                get_liked_artist_counts()
-            )
-
-        if exclude_top_artists:
-
-            top_artist_ids = (
-                get_top_artist_ids()
-            )
-
-        # ---------------------------------------------
-        # RESOLVE CANDIDATES
-        # ---------------------------------------------
-
-        selected_artists = []
-
-        seen_ids = set()
-
-        excluded_debug = []
-
-        for candidate_name in candidate_artists:
-
-            if (
-                len(selected_artists)
-                >= artist_count
-            ):
-                break
-
-            artist = spotify_find_artist(
-                candidate_name
-            )
-
-            if not artist:
-                continue
-
-            artist_id = artist.get(
-                "id"
-            )
-
-            if not artist_id:
-                continue
-
-            artist_name = artist.get(
-                "name",
-                candidate_name
-            )
-
-            # -----------------------------------------
-            # SEED
-            # -----------------------------------------
-
-            if (
-                seed_id
-                and artist_id == seed_id
-            ):
-
-                excluded_debug.append(
-                    (
-                        artist_name,
-                        "seed artist"
-                    )
-                )
-
-                continue
-
-            # -----------------------------------------
-            # DUPLICATE
-            # -----------------------------------------
-
-            if artist_id in seen_ids:
-
-                continue
-
-            seen_ids.add(
-                artist_id
-            )
-
-            # -----------------------------------------
-            # LIKED SONG HARD FILTER
-            # -----------------------------------------
-
-            liked_count = (
-                liked_counts.get(
-                    artist_id,
-                    0
-                )
-            )
-
-            if (
-                exclude_favorites
-                and liked_count
-                >= min_liked_tracks_to_exclude
-            ):
-
-                excluded_debug.append(
-                    (
-                        artist_name,
-                        f"{liked_count} Liked Songs"
-                    )
-                )
-
-                print(
-                    "DISCOVERY EXCLUDED:",
-                    artist_name,
-                    "- liked:",
-                    liked_count,
-                )
-
-                continue
-
-            # -----------------------------------------
-            # TOP ARTIST HARD FILTER
-            # -----------------------------------------
-
-            if (
-                exclude_top_artists
-                and artist_id
-                in top_artist_ids
-            ):
-
-                excluded_debug.append(
-                    (
-                        artist_name,
-                        "Top Artist"
-                    )
-                )
-
-                print(
-                    "DISCOVERY EXCLUDED:",
-                    artist_name,
-                    "- Top Artist"
-                )
-
-                continue
-
-            # -----------------------------------------
-            # TRACKS
-            # -----------------------------------------
-
-            tracks = (
-                spotify_tracks_for_artist(
-                    artist,
-                    count=tracks_per_artist,
-                )
-            )
-
-            if not tracks:
-                continue
-
-            selected_artists.append(
-                {
-                    "artist": artist,
-                    "tracks": tracks,
-                    "liked_count": liked_count,
-                }
-            )
-
-        # ---------------------------------------------
-        # NOT ENOUGH?
-        # ---------------------------------------------
-
-        if not selected_artists:
-
-            return (
-                "Nisam pronašao dovoljno novih izvođača "
-                "nakon provjere tvoje biblioteke i "
-                "Top Artists. Probaj širi opis ili drugi "
-                "seed artist."
-            )
-
-        # ---------------------------------------------
-        # FORMAT TELEGRAM RESULT
-        # ---------------------------------------------
-
-        lines = [
-            (
-                f"Discovery prema {seed_artist}:"
-            )
-        ]
-
-        playlist_tracks = []
-
-        for index, item in enumerate(
-            selected_artists,
-            1
-        ):
-
-            artist = item[
-                "artist"
-            ]
-
-            tracks = item[
-                "tracks"
-            ]
-
-            lines.append(
-                f"\n{index}. {artist['name']}"
-            )
-
-            for track in tracks:
-
-                lines.append(
-                    f"   • {track['name']}"
-                )
-
-                playlist_tracks.append(
-                    {
-                        "id": track.get("id"),
-                        "uri": track.get("uri"),
-                        "name": track.get(
-                            "name",
-                            ""
-                        ),
-                        "artist": artist[
-                            "name"
-                        ],
-                        "artist_id": artist[
-                            "id"
-                        ],
-                    }
-                )
-
-        # ---------------------------------------------
-        # OPTIONAL PLAYLIST
-        # ---------------------------------------------
-
-        if create_discovery_playlist:
-
-            if not playlist_name:
-
-                playlist_name = (
-                    f"Discovery: {seed_artist}"
-                )
-
-            playlist_result = create_playlist(
-                name=playlist_name,
-                tracks=playlist_tracks,
-                description=(
-                    "AI Discovery V2. "
-                    f"Seed: {seed_artist}. "
-                    "Izvođači provjereni protiv "
-                    "Liked Songs i Top Artists."
-                ),
-            )
-
-            lines.append(
-                "\n" + playlist_result
-            )
-
-        # ---------------------------------------------
-        # DEBUG
-        # ---------------------------------------------
-
-        print(
-            "\nDISCOVERY SELECTED:"
-        )
-
-        for item in selected_artists:
-
-            print(
-                " +",
-                item["artist"]["name"],
-                "liked=",
-                item["liked_count"]
-            )
-
-        print(
-            "\nDISCOVERY EXCLUDED:"
-        )
-
-        for artist_name, reason in excluded_debug:
-
-            print(
-                " -",
-                artist_name,
-                ":",
-                reason
-            )
-
-        return "\n".join(lines)
-
-    except Exception as e:
-
-        return (
-            f"Discovery V2 nije uspio: {e}"
-        )
-
-
-# =========================================================
-# TOP ITEMS
-# =========================================================
-
-def normalize_time_range(value):
-
-    mapping = {
-        "month": "short_term",
-        "mjesec": "short_term",
-        "short_term": "short_term",
-
-        "6months": "medium_term",
-        "6 mjeseci": "medium_term",
-        "medium_term": "medium_term",
-
-        "year": "long_term",
-        "godina": "long_term",
-        "long_term": "long_term",
-    }
-
-    return mapping.get(
-        str(value).lower(),
-        "medium_term"
-    )
-
-
-def spotify_top_tracks(
-    time_range="medium_term",
-    limit=10
-):
-
-    try:
-
-        result = spotify.current_user_top_tracks(
-            limit=max(
-                1,
-                min(
-                    int(limit),
-                    50
-                )
-            ),
-            time_range=normalize_time_range(
-                time_range
-            ),
-        )
-
-        return "\n".join(
-            (
-                f"{i}. "
-                f"{', '.join(a['name'] for a in track['artists'])}"
-                f" - {track['name']}"
-            )
-            for i, track in enumerate(
-                result.get(
-                    "items",
-                    []
-                ),
-                1
-            )
-        )
-
-    except Exception as e:
-
-        return f"Top tracks greška: {e}"
-
-
-def spotify_top_artists(
-    time_range="medium_term",
-    limit=10
-):
-
-    try:
-
-        result = spotify.current_user_top_artists(
-            limit=max(
-                1,
-                min(
-                    int(limit),
-                    50
-                )
-            ),
-            time_range=normalize_time_range(
-                time_range
-            ),
-        )
-
-        return "\n".join(
-            f"{i}. {artist['name']}"
-            for i, artist in enumerate(
-                result.get(
-                    "items",
-                    []
-                ),
-                1
-            )
-        )
-
-    except Exception as e:
-
-        return f"Top artists greška: {e}"
-
-
-# =========================================================
-# ARTIST GENRE CACHE
-# =========================================================
-
-def get_artist_genres(
-    artist_id,
-    artist_name=""
-):
-
-    if not artist_id:
-        return []
-
-    conn = sqlite3.connect(DB_FILE)
-
-    row = conn.execute(
-        """
-        SELECT genres
-        FROM artist_cache
-        WHERE artist_id = ?
-        """,
-        (artist_id,),
-    ).fetchone()
-
-    if row:
-
-        conn.close()
-
-        try:
-
-            return json.loads(
-                row[0]
-            )
-
-        except Exception:
-
-            return []
-
-    try:
-
-        artist = spotify.artist(
-            artist_id
-        )
-
-        genres = [
-            g.lower()
-            for g in artist.get(
-                "genres",
-                []
-            )
-        ]
-
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO artist_cache (
-                artist_id,
-                artist_name,
-                genres,
-                updated_at
-            )
-            VALUES (?, ?, ?, ?)
-            """,
-            (
-                artist_id,
-                artist.get(
-                    "name",
-                    artist_name
-                ),
-                json.dumps(genres),
-                datetime.now(
-                    timezone.utc
-                ).isoformat(),
-            ),
-        )
-
-        conn.commit()
-        conn.close()
-
-        return genres
-
-    except Exception:
-
-        conn.close()
-
-        return []
-
-
-def is_domestic_track(track):
-
-    artist = track.get(
-        "artist",
-        ""
-    ).lower()
-
-    return any(
-        domestic in artist
-        for domestic in DOMESTIC_ARTISTS
-    )
-
-
-def track_genre_matches(
-    track,
-    genre
-):
-
-    genres = get_artist_genres(
-        track.get("artist_id"),
-        track.get("artist", ""),
-    )
-
-    genre_text = " ".join(
-        genres
-    )
-
-    genre = genre.lower().strip()
-
-    keywords = GENRE_KEYWORDS.get(
-        genre,
-        [genre]
-    )
-
-    return any(
-        keyword in genre_text
-        for keyword in keywords
-    )
-
-
-# =========================================================
-# PLAYLIST CREATION
-# =========================================================
-
-def create_playlist(
-    name,
-    tracks,
-    description="Telegram AI playlist",
-):
-
-    if not tracks:
-
-        return (
-            "Nema pjesama za playlistu."
-        )
-
-    try:
-
-        playlist = (
-            spotify
-            .current_user_playlist_create(
-                name=name,
-                public=False,
-                description=description[:300],
-            )
-        )
-
-        uris = [
-            track["uri"]
-            for track in tracks
-            if track.get("uri")
-        ]
-
-        # Spotipy će ovisno o verziji mapirati
-        # odgovarajući aktualni playlist endpoint.
-        for i in range(
-            0,
-            len(uris),
-            100
-        ):
-
-            spotify.playlist_add_items(
-                playlist["id"],
-                uris[i:i + 100],
-            )
-
-        url = (
-            playlist
-            .get(
-                "external_urls",
-                {}
-            )
-            .get(
-                "spotify",
-                ""
-            )
-        )
-
-        return (
-            f"Playlist '{name}' "
-            f"({len(uris)} pjesama)\n{url}"
-        )
-
-    except Exception as e:
-
-        return (
-            f"Playlist nije uspjela: {e}"
-        )
-
-
-# =========================================================
-# SMART PLAYLIST V3
-# =========================================================
-
-def spotify_create_smart_playlist_v3(
-    name,
-    max_tracks=30,
-    genres=None,
-    domestic_weight=0,
-    domestic_required=False,
-    favorite_weight=0,
-    forgotten_weight=0,
-    avoid_recent_days=None,
-    recent_penalty=0,
-    max_recent_plays=None,
-    recent_period_days=30,
-    max_per_artist=2,
-    avoid_consecutive_artist=True,
-    randomness=1.0,
-):
-
-    try:
-
-        sync_history_if_needed()
-
-        genres = genres or []
-
-        max_tracks = max(
-            1,
-            min(
-                int(max_tracks),
-                100
-            )
-        )
-
-        max_per_artist = max(
-            1,
-            int(
-                max_per_artist or 2
-            )
-        )
-
-        liked = spotify_get_liked_tracks(
-            max_tracks=2000
-        )
-
-        if not liked:
-
-            return "Nema Liked Songs."
-
-        total_counts = (
-            get_all_play_counts()
-        )
-
-        recent_counts = (
-            get_recent_play_counts(
-                recent_period_days
-            )
-        )
-
-        last_dates = (
-            get_last_play_dates()
-        )
-
-        max_total = max(
-            total_counts.values(),
-            default=1
-        )
-
-        candidates = []
-
-        for track in liked:
-
-            track_id = track.get("id")
-
-            if not track_id:
-                continue
-
-            domestic = (
-                is_domestic_track(
-                    track
-                )
-            )
-
-            if (
-                domestic_required
-                and not domestic
-            ):
-                continue
-
-            recent_plays = (
-                recent_counts.get(
-                    track_id,
-                    0
-                )
-            )
-
-            if (
-                max_recent_plays
-                is not None
-                and recent_plays
-                > int(max_recent_plays)
-            ):
-                continue
-
-            total_plays = (
-                total_counts.get(
-                    track_id,
-                    0
-                )
-            )
-
-            days_old = days_since_played(
-                last_dates.get(
-                    track_id
-                )
-            )
-
-            score = 0.0
-
-            # Genres
-            for genre_spec in genres:
-
-                genre_name = (
-                    genre_spec
-                    .get(
-                        "name",
-                        ""
-                    )
-                )
-
-                weight = float(
-                    genre_spec.get(
-                        "weight",
-                        1
-                    )
-                )
-
-                if (
-                    genre_name
-                    and track_genre_matches(
-                        track,
-                        genre_name
-                    )
-                ):
-
-                    score += weight
-
-            # Domestic
-            if domestic:
-
-                score += float(
-                    domestic_weight
-                )
-
-            # Favorites
-            if favorite_weight:
-
-                factor = (
-                    math.log1p(
-                        total_plays
-                    )
-                    /
-                    math.log1p(
-                        max_total
-                    )
-                )
-
-                score += (
-                    factor
-                    * float(
-                        favorite_weight
-                    )
-                )
-
-            # Forgotten
-            if forgotten_weight:
-
-                forgotten_factor = min(
-                    days_old / 180.0,
-                    1.0
-                )
-
-                score += (
-                    forgotten_factor
-                    * float(
-                        forgotten_weight
-                    )
-                )
-
-            # Recent penalty
-            if (
-                avoid_recent_days
-                and recent_penalty
-                and days_old
-                < int(avoid_recent_days)
-            ):
-
-                factor = (
-                    1
-                    - days_old
-                    / int(
-                        avoid_recent_days
-                    )
-                )
-
-                score -= (
-                    factor
-                    * float(
-                        recent_penalty
-                    )
-                )
-
-            score += random.uniform(
-                0,
-                max(
-                    0,
-                    float(randomness)
-                )
-            )
-
-            candidates.append(
-                {
-                    **track,
-                    "_score": score,
-                }
-            )
-
-        candidates.sort(
-            key=lambda x:
-                x["_score"],
-            reverse=True
-        )
-
-        selected = []
-
-        artist_counts = {}
-
-        previous_artist = None
-
-        for track in candidates:
-
-            if len(selected) >= max_tracks:
-                break
-
-            artist = track.get(
-                "artist",
-                ""
-            ).lower()
-
-            if (
-                artist_counts.get(
-                    artist,
-                    0
-                )
-                >= max_per_artist
-            ):
-                continue
-
-            if (
-                avoid_consecutive_artist
-                and previous_artist
-                == artist
-            ):
-                continue
-
-            selected.append(
-                track
-            )
-
-            artist_counts[artist] = (
-                artist_counts.get(
-                    artist,
-                    0
-                )
-                + 1
-            )
-
-            previous_artist = artist
-
-        return create_playlist(
-            name=name,
-            tracks=selected,
-            description=(
-                "Telegram AI Smart Playlist V3"
-            ),
-        )
-
-    except Exception as e:
-
-        return (
-            f"Smart Playlist V3 greška: {e}"
-        )
-
-
-# =========================================================
-# HISTORY STATS
-# =========================================================
-
-def _history_utc_bound(local_date, next_day=False):
-
-    # played_at je UTC ("...Z"), a korisnik pita po lokalnim danima. Granica
-    # se pretvara u UTC; za kraj perioda uzima se početak sljedećeg dana.
-    day = datetime.fromisoformat(
-        str(local_date)[:10]
-    ).date()
-
-    if next_day:
-        day += timedelta(days=1)
-
-    local_start = datetime.combine(
-        day,
-        time.min,
-        tzinfo=ZoneInfo(calendar_service.TIME_ZONE),
-    )
-
-    return local_start.astimezone(
-        timezone.utc
-    ).strftime("%Y-%m-%dT%H:%M:%S")
-
-
-def _history_period_filter(start_date, end_date):
-
-    clause = ""
-    params = []
-
-    if start_date:
-        clause += " AND played_at >= ?"
-        params.append(_history_utc_bound(start_date))
-
-    if end_date:
-        clause += " AND played_at < ?"
-        params.append(_history_utc_bound(end_date, next_day=True))
-
-    return clause, params
-
-
-def spotify_history_stats(
-    start_date=None,
-    end_date=None,
-    limit=10
-):
-
-    sync_history_if_needed()
-
-    conn = sqlite3.connect(DB_FILE)
-
-    query = """
-        SELECT
-            track_name,
-            artist_name,
-            COUNT(*) AS plays
-        FROM listening_history
-        WHERE 1=1
-    """
-
-    clause, params = _history_period_filter(
-        start_date,
-        end_date
-    )
-
-    query += clause
-
-    query += """
-        GROUP BY
-            track_id,
-            track_name,
-            artist_name
-        ORDER BY plays DESC
-        LIMIT ?
-    """
-
-    params.append(
-        min(
-            int(limit),
-            50
-        )
-    )
-
-    rows = conn.execute(
-        query,
-        params
-    ).fetchall()
-
-    conn.close()
-
-    if not rows:
-
-        return (
-            "Nemam dovoljno lokalne povijesti "
-            "za taj period."
-        )
-
-    return "\n".join(
-        (
-            f"{i}. {artist} - {track}: "
-            f"{plays} slušanja"
-        )
-        for i, (
-            track,
-            artist,
-            plays
-        ) in enumerate(
-            rows,
-            1
-        )
-    )
-
-
-def spotify_history_list(
-    start_date=None,
-    end_date=None,
-    limit=50,
-    create_playlist_from_history=False,
-    playlist_name=None,
-):
-
-    sync_history_if_needed()
-
-    limit = max(1, min(int(limit or 50), 200))
-
-    # Bez kraja perioda misli se na jedan dan ("što sam slušao jučer").
-    end_date = end_date or start_date
-
-    clause, params = _history_period_filter(
-        start_date,
-        end_date
-    )
-
-    conn = sqlite3.connect(DB_FILE)
-
-    rows = conn.execute(
-        """
-        SELECT played_at, track_name, artist_name, track_uri
-        FROM listening_history
-        WHERE 1=1
-        """
-        + clause
-        + " ORDER BY played_at ASC",
-        params,
-    ).fetchall()
-
-    conn.close()
-
-    if not rows:
-
-        return (
-            "Nemam zabilježenih slušanja "
-            "za taj period."
-        )
-
-    if create_playlist_from_history:
-
-        # Svaka pjesma samo jednom, redom prvog slušanja.
-        tracks = []
-        seen = set()
-
-        for _, track_name, artist_name, uri in rows:
-
-            if not uri or uri in seen:
-                continue
-
-            seen.add(uri)
-            tracks.append({"uri": uri})
-
-        name = playlist_name or (
-            f"Slušano {start_date}"
-            if not end_date or end_date == start_date
-            else f"Slušano {start_date} – {end_date}"
-        )
-
-        return create_playlist(
-            name=name,
-            tracks=tracks,
-            description="Telegram AI playlist iz povijesti slušanja",
-        )
-
-    zone = ZoneInfo(calendar_service.TIME_ZONE)
-
-    lines = []
-
-    for played_at, track_name, artist_name, _ in rows[-limit:]:
-
-        local = datetime.fromisoformat(
-            played_at.replace("Z", "+00:00")
-        ).astimezone(zone)
-
-        lines.append(
-            f"{local:%d.%m. %H:%M} {artist_name} - {track_name}"
-        )
-
-    header = f"Ukupno slušanja: {len(rows)}"
-
-    if len(rows) > limit:
-        header += f" (prikazano zadnjih {limit})"
-
-    return header + "\n" + "\n".join(lines)
-
-
-# =========================================================
 # LOCAL COMMANDS
 # =========================================================
 
@@ -3129,90 +885,49 @@ def _try_local_birthdays_command(message):
     return "\n".join(lines)
 
 
-def try_local_command(message):
+LOCAL_SPOTIFY_COMMANDS = {
+    spotify_service.current_track: (
+        "što svira", "sto svira", "što trenutno svira", "sto trenutno svira",
+        "što sad svira", "sto sad svira", "šta svira", "šta sad svira",
+    ),
+    spotify_service.pause: ("pauza", "pauziraj", "stop", "stani"),
+    spotify_service.resume: (
+        "nastavi", "play", "nastavi glazbu", "nastavi spotify", "pusti dalje",
+    ),
+    spotify_service.next_track: (
+        "dalje", "sljedeća", "sljedeca", "sljedeća pjesma", "sljedeca pjesma",
+        "preskoči", "preskoci", "preskoči pjesmu", "preskoci pjesmu", "next",
+    ),
+    spotify_service.previous_track: (
+        "prethodna", "prethodna pjesma", "vrati prethodnu", "nazad",
+    ),
+    spotify_service.devices: ("uređaji", "uredaji", "spotify uređaji"),
+}
 
-    text = message.lower().strip()
+
+def try_local_command(message):
 
     birthdays = _try_local_birthdays_command(message)
     if birthdays is not None:
         return birthdays
 
-    if any(
-        x in text
-        for x in [
-            "što trenutno svira",
-            "sto trenutno svira",
-            "što svira",
-            "sto svira",
-        ]
-    ):
+    # Brze naredbe reagiraju samo kad je fraza cijela poruka, da npr.
+    # "dodaj pauza za ručak u kalendar" ne zaustavi glazbu.
+    text = re.sub(r"[?!.,]+$", "", message.lower().strip()).strip()
 
-        return spotify_current_track()
+    for action, phrases in LOCAL_SPOTIFY_COMMANDS.items():
+        if text in phrases:
+            return action()
 
-    if any(
-        x in text
-        for x in [
-            "pauziraj",
-            "pauza",
-        ]
-    ):
-
-        return spotify_pause()
-
-    if any(
-        x in text
-        for x in [
-            "nastavi glazbu",
-            "nastavi spotify",
-        ]
-    ):
-
-        return spotify_resume()
-
-    if any(
-        x in text
-        for x in [
-            "sljedeća pjesma",
-            "sljedeca pjesma",
-            "preskoči pjesmu",
-        ]
-    ):
-
-        return spotify_next()
-
-    if any(
-        x in text
-        for x in [
-            "prethodna pjesma",
-            "vrati prethodnu",
-        ]
-    ):
-
-        return spotify_previous()
-
-    volume = re.search(
-        r"(?:glasnoća|glasnoca|volume).*?(\d{1,3})",
-        text
-    )
-
+    volume = re.fullmatch(r"(?:glasnoća|glasnoca|volume|vol)\s*(\d{1,3})\s*%?", text)
     if volume:
+        return spotify_service.set_volume(volume.group(1))
 
-        return spotify_set_volume(
-            volume.group(1)
-        )
+    if text in ("shuffle", "shuffle on", "uključi shuffle", "ukljuci shuffle"):
+        return spotify_service.set_shuffle(True)
 
-    if "shuffle" in text:
-
-        return spotify_shuffle(
-            not any(
-                x in text
-                for x in [
-                    "isključi",
-                    "iskljuci",
-                    "off",
-                ]
-            )
-        )
+    if text in ("shuffle off", "isključi shuffle", "iskljuci shuffle", "shuffle isključi"):
+        return spotify_service.set_shuffle(False)
 
     return None
 
@@ -3221,36 +936,21 @@ def try_local_command(message):
 # MODEL ROUTER
 # =========================================================
 
+# Spotify zahtjevi traže dobro razumijevanje glazbe (žanrovi, slični
+# izvođači, raspodjela pjesama), pa za njih nano model nije dovoljan.
+SMART_KEYWORDS = (
+    "playlist", "pjesm", "izvođ", "izvod", "bend", "grup", "album",
+    "slič", "slic", "discovery", "slušao", "slusao", "slušam", "slusam",
+    "liked", "žanr", "zanr", "punk", "rock", "jazz", "pusti", "queue",
+    "u red", "spotify", "glazb", "analiziraj", "usporedi", "preferiraj",
+)
+
+
 def choose_model(message):
 
     text = message.lower()
 
-    smart = [
-        "playlist",
-        "playlista",
-        "slič",
-        "slic",
-        "bendova kao",
-        "bandova kao",
-        "izvođača kao",
-        "izvodaca kao",
-        "discovery",
-        "koje ne slušam",
-        "koje ne slusam",
-        "nisu među",
-        "nisu medu",
-        "analiziraj",
-        "usporedi",
-        "punk",
-        "post-punk",
-        "preferiraj",
-    ]
-
-    if any(
-        keyword in text
-        for keyword in smart
-    ):
-
+    if any(keyword in text for keyword in SMART_KEYWORDS):
         return SMART_MODEL
 
     return CHEAP_MODEL
@@ -3260,410 +960,90 @@ def choose_model(message):
 # OPENAI TOOLS
 # =========================================================
 
-TOOLS = [
-
+SPOTIFY_TOOLS = [
     {
         "type": "function",
-        "name": "spotify_current_track",
-        "description": "Provjeri što trenutno svira.",
-        "parameters": {
-            "type": "object",
-            "properties": {},
-            "additionalProperties": False,
-        },
+        "name": "spotify_now_playing",
+        "description": "Što trenutno svira na Spotifyju.",
+        "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
     },
-
     {
         "type": "function",
-        "name": "spotify_search_and_play",
-        "description": "Pretraži Spotify i pusti pjesmu.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string"
-                }
-            },
-            "required": ["query"],
-            "additionalProperties": False,
-        },
+        "name": "spotify_play",
+        "description": "Pusti pjesmu, izvođača, album ili playlistu na aktivnom uređaju.",
+        "parameters": {"type": "object", "properties": {"query": {"type": "string", "description": "Za pjesmu: 'Izvođač - Naslov'."}, "kind": {"type": "string", "enum": ["track", "artist", "album", "playlist"]}}, "required": ["query", "kind"], "additionalProperties": False},
     },
-
     {
         "type": "function",
         "name": "spotify_get_queue",
-        "description": "Prikaži Spotify queue.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "limit": {
-                    "type": "integer"
-                }
-            },
-            "required": ["limit"],
-            "additionalProperties": False,
-        },
+        "description": "Prikaži Spotify red reprodukcije.",
+        "parameters": {"type": "object", "properties": {"limit": {"type": "integer"}}, "required": ["limit"], "additionalProperties": False},
     },
-
     {
         "type": "function",
         "name": "spotify_add_to_queue",
-        "description": "Dodaj pjesmu u queue.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string"
-                }
-            },
-            "required": ["query"],
-            "additionalProperties": False,
-        },
+        "description": "Dodaj jednu ili više pjesama u red, zadanim redoslijedom.",
+        "parameters": {"type": "object", "properties": {"tracks": {"type": "array", "items": {"type": "string"}, "description": "Pjesme kao 'Izvođač - Naslov'."}}, "required": ["tracks"], "additionalProperties": False},
     },
-
     {
         "type": "function",
-        "name": "spotify_top_tracks",
-        "description": "Korisnikove Spotify top pjesme.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "time_range": {
-                    "type": "string"
-                },
-                "limit": {
-                    "type": "integer"
-                }
-            },
-            "required": [
-                "time_range",
-                "limit"
-            ],
-            "additionalProperties": False,
-        },
+        "name": "spotify_playlist_from_artists",
+        "description": "Napravi playlistu isključivo od pjesama navedenih izvođača (najpoznatije prve). Npr. '20 pjesama Fontaines D.C.'.",
+        "parameters": {"type": "object", "properties": {"artists": {"type": "array", "items": {"type": "object", "properties": {"name": {"type": "string"}, "count": {"type": "integer", "description": "Broj pjesama tog izvođača."}}, "required": ["name", "count"], "additionalProperties": False}}, "name": {"type": ["string", "null"], "description": "Ime playliste; null = automatski."}, "mix": {"type": "boolean", "description": "Izvođači naizmjence (true) ili redom po izvođaču (false)."}}, "required": ["artists", "name", "mix"], "additionalProperties": False},
     },
-
     {
         "type": "function",
-        "name": "spotify_top_artists",
-        "description": "Korisnikovi Spotify top izvođači.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "time_range": {
-                    "type": "string"
-                },
-                "limit": {
-                    "type": "integer"
-                }
-            },
-            "required": [
-                "time_range",
-                "limit"
-            ],
-            "additionalProperties": False,
-        },
+        "name": "spotify_playlist_from_tracks",
+        "description": "Napravi playlistu od zadanog popisa pjesama, istim redom.",
+        "parameters": {"type": "object", "properties": {"tracks": {"type": "array", "items": {"type": "string"}, "description": "Pjesme kao 'Izvođač - Naslov'."}, "name": {"type": ["string", "null"], "description": "Ime playliste; null = automatski."}}, "required": ["tracks", "name"], "additionalProperties": False},
     },
-
+    {
+        "type": "function",
+        "name": "spotify_add_to_playlist",
+        "description": "Dodaj pjesme u postojeću korisnikovu playlistu.",
+        "parameters": {"type": "object", "properties": {"playlist_name": {"type": "string"}, "tracks": {"type": "array", "items": {"type": "string"}, "description": "Pjesme kao 'Izvođač - Naslov'."}}, "required": ["playlist_name", "tracks"], "additionalProperties": False},
+    },
+    {
+        "type": "function",
+        "name": "spotify_similar_artists",
+        "description": "Izvođači slični zadanom (discovery). Ti predlažeš kandidate, alat provjerava postoje li na Spotifyju i sluša li ih korisnik već.",
+        "parameters": {"type": "object", "properties": {"seed_artist": {"type": "string"}, "candidate_artists": {"type": "array", "items": {"type": "string"}, "description": "15-25 stilski srodnih izvođača, bez seed izvođača."}, "artist_count": {"type": "integer"}, "tracks_per_artist": {"type": "integer"}, "only_new": {"type": "boolean", "description": "Izbaci izvođače koje korisnik već sluša."}, "create_playlist": {"type": "boolean"}, "playlist_name": {"type": ["string", "null"], "description": "Ime playliste; null = automatski."}}, "required": ["seed_artist", "candidate_artists", "artist_count", "tracks_per_artist", "only_new", "create_playlist", "playlist_name"], "additionalProperties": False},
+    },
+    {
+        "type": "function",
+        "name": "spotify_playlist_from_liked",
+        "description": "Napravi playlistu iz korisnikovih Liked Songs prema žanrovima, domaćim izvođačima ili raspoloženju.",
+        "parameters": {"type": "object", "properties": {"name": {"type": ["string", "null"], "description": "Ime playliste; null = automatski."}, "track_count": {"type": "integer"}, "genres": {"type": "array", "description": "Udio pjesama po žanru; prazno = bez žanrovskog filtra.", "items": {"type": "object", "properties": {"name": {"type": "string"}, "weight": {"type": "number"}}, "required": ["name", "weight"], "additionalProperties": False}}, "domestic": {"type": "string", "enum": ["any", "prefer", "only", "exclude"], "description": "Domaći = izvođači s prostora bivše Jugoslavije."}, "artists": {"type": ["array", "null"], "items": {"type": "string"}, "description": "Samo pjesme ovih izvođača iz Liked Songs."}, "mode": {"type": "string", "enum": ["mixed", "favorites", "forgotten"], "description": "favorites = najslušanije, forgotten = dugo neslušane."}, "avoid_recent_days": {"type": ["integer", "null"], "description": "Izbaci pjesme slušane u zadnjih N dana."}, "max_per_artist": {"type": "integer"}}, "required": ["name", "track_count", "genres", "domestic", "artists", "mode", "avoid_recent_days", "max_per_artist"], "additionalProperties": False},
+    },
+    {
+        "type": "function",
+        "name": "spotify_top",
+        "description": "Korisnikove top pjesme ili top izvođači prema Spotifyju.",
+        "parameters": {"type": "object", "properties": {"kind": {"type": "string", "enum": ["tracks", "artists"]}, "time_range": {"type": "string", "enum": ["short_term", "medium_term", "long_term"]}, "limit": {"type": "integer"}}, "required": ["kind", "time_range", "limit"], "additionalProperties": False},
+    },
     {
         "type": "function",
         "name": "spotify_list_liked",
-        "description": "Prikaži Liked Songs.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "limit": {
-                    "type": "integer"
-                }
-            },
-            "required": ["limit"],
-            "additionalProperties": False,
-        },
+        "description": "Zadnje dodane Liked Songs.",
+        "parameters": {"type": "object", "properties": {"limit": {"type": "integer"}}, "required": ["limit"], "additionalProperties": False},
     },
-
-    # =====================================================
-    # DISCOVERY V2
-    # =====================================================
-
-    {
-        "type": "function",
-        "name": "spotify_discover_artists_v2",
-
-        "description": (
-            "Pronađi izvođače slične seed izvođaču. "
-            "GPT daje širi popis kandidata, a Python hard-filtrira "
-            "izvođače koji su već među korisnikovim Top Artists "
-            "ili imaju dovoljno Liked Songs."
-        ),
-
-        "parameters": {
-
-            "type": "object",
-
-            "properties": {
-
-                "seed_artist": {
-                    "type": "string"
-                },
-
-                "candidate_artists": {
-                    "type": "array",
-                    "items": {
-                        "type": "string"
-                    },
-                    "description": (
-                        "15-25 stilistički srodnih izvođača. "
-                        "Navedi više kandidata nego što korisnik traži."
-                    )
-                },
-
-                "artist_count": {
-                    "type": "integer"
-                },
-
-                "tracks_per_artist": {
-                    "type": "integer"
-                },
-
-                "exclude_favorites": {
-                    "type": "boolean"
-                },
-
-                "exclude_top_artists": {
-                    "type": "boolean"
-                },
-
-                "min_liked_tracks_to_exclude": {
-                    "type": "integer"
-                },
-
-                "create_discovery_playlist": {
-                    "type": "boolean"
-                },
-
-                "playlist_name": {
-                    "type": [
-                        "string",
-                        "null"
-                    ]
-                },
-            },
-
-            "required": [
-                "seed_artist",
-                "candidate_artists",
-                "artist_count",
-                "tracks_per_artist",
-                "exclude_favorites",
-                "exclude_top_artists",
-                "min_liked_tracks_to_exclude",
-                "create_discovery_playlist",
-                "playlist_name"
-            ],
-
-            "additionalProperties": False,
-        },
-    },
-
-    # =====================================================
-    # SMART PLAYLIST V3
-    # =====================================================
-
-    {
-        "type": "function",
-        "name": "spotify_create_smart_playlist_v3",
-
-        "description": (
-            "Kreiraj pametnu playlistu iz korisnikovih "
-            "Liked Songs pomoću soft scoring kriterija."
-        ),
-
-        "parameters": {
-
-            "type": "object",
-
-            "properties": {
-
-                "name": {
-                    "type": "string"
-                },
-
-                "max_tracks": {
-                    "type": "integer"
-                },
-
-                "genres": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "name": {
-                                "type": "string"
-                            },
-                            "weight": {
-                                "type": "number"
-                            }
-                        },
-                        "required": [
-                            "name",
-                            "weight"
-                        ],
-                        "additionalProperties": False,
-                    }
-                },
-
-                "domestic_weight": {
-                    "type": "number"
-                },
-
-                "domestic_required": {
-                    "type": "boolean"
-                },
-
-                "favorite_weight": {
-                    "type": "number"
-                },
-
-                "forgotten_weight": {
-                    "type": "number"
-                },
-
-                "avoid_recent_days": {
-                    "type": [
-                        "integer",
-                        "null"
-                    ]
-                },
-
-                "recent_penalty": {
-                    "type": "number"
-                },
-
-                "max_recent_plays": {
-                    "type": [
-                        "integer",
-                        "null"
-                    ]
-                },
-
-                "recent_period_days": {
-                    "type": "integer"
-                },
-
-                "max_per_artist": {
-                    "type": "integer"
-                },
-
-                "avoid_consecutive_artist": {
-                    "type": "boolean"
-                },
-
-                "randomness": {
-                    "type": "number"
-                },
-            },
-
-            "required": [
-                "name",
-                "max_tracks",
-                "genres",
-                "domestic_weight",
-                "domestic_required",
-                "favorite_weight",
-                "forgotten_weight",
-                "avoid_recent_days",
-                "recent_penalty",
-                "max_recent_plays",
-                "recent_period_days",
-                "max_per_artist",
-                "avoid_consecutive_artist",
-                "randomness"
-            ],
-
-            "additionalProperties": False,
-        },
-    },
-
-    {
-        "type": "function",
-        "name": "spotify_history_stats",
-        "description": (
-            "Top pjesme iz lokalne history baze "
-            "za točan datumski period."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "start_date": {
-                    "type": [
-                        "string",
-                        "null"
-                    ]
-                },
-                "end_date": {
-                    "type": [
-                        "string",
-                        "null"
-                    ]
-                },
-                "limit": {
-                    "type": "integer"
-                }
-            },
-            "required": [
-                "start_date",
-                "end_date",
-                "limit"
-            ],
-            "additionalProperties": False,
-        },
-    },
-
     {
         "type": "function",
         "name": "spotify_history_list",
-        "description": (
-            "Kronološki popis pjesama koje je korisnik slušao u lokalnom "
-            "datumskom periodu (npr. jučer). Opcionalno od njih napravi "
-            "playlistu."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "start_date": {
-                    "type": "string",
-                    "description": "Lokalni datum YYYY-MM-DD.",
-                },
-                "end_date": {
-                    "type": [
-                        "string",
-                        "null"
-                    ],
-                    "description": "Lokalni datum YYYY-MM-DD, uključivo.",
-                },
-                "limit": {
-                    "type": "integer"
-                },
-                "create_playlist": {
-                    "type": "boolean"
-                },
-                "playlist_name": {
-                    "type": [
-                        "string",
-                        "null"
-                    ]
-                },
-            },
-            "required": [
-                "start_date",
-                "end_date",
-                "limit",
-                "create_playlist",
-                "playlist_name"
-            ],
-            "additionalProperties": False,
-        },
+        "description": "Kronološki popis pjesama koje je korisnik slušao u lokalnom datumskom periodu (npr. jučer). Opcionalno od njih napravi playlistu.",
+        "parameters": {"type": "object", "properties": {"start_date": {"type": "string", "description": "YYYY-MM-DD"}, "end_date": {"type": ["string", "null"], "description": "YYYY-MM-DD, uključivo; null = isti dan."}, "limit": {"type": "integer"}, "create_playlist": {"type": "boolean"}, "playlist_name": {"type": ["string", "null"], "description": "Ime playliste; null = automatski."}}, "required": ["start_date", "end_date", "limit", "create_playlist", "playlist_name"], "additionalProperties": False},
     },
+    {
+        "type": "function",
+        "name": "spotify_history_stats",
+        "description": "Najslušanije pjesme ili izvođači iz lokalne povijesti za period.",
+        "parameters": {"type": "object", "properties": {"start_date": {"type": ["string", "null"], "description": "YYYY-MM-DD"}, "end_date": {"type": ["string", "null"], "description": "YYYY-MM-DD, uključivo"}, "limit": {"type": "integer"}, "group_by": {"type": "string", "enum": ["track", "artist"]}}, "required": ["start_date", "end_date", "limit", "group_by"], "additionalProperties": False},
+    },
+]
+
+
+TOOLS = [
+    *SPOTIFY_TOOLS,
 
     {
         "type": "function",
@@ -3967,6 +1347,89 @@ TOOLS = [
 # TOOL EXECUTION
 # =========================================================
 
+def execute_spotify_tool(name, args):
+
+    if name == "spotify_now_playing":
+        return spotify_service.current_track()
+
+    if name == "spotify_play":
+        return spotify_service.play(args.get("query", ""), args.get("kind", "track"))
+
+    if name == "spotify_get_queue":
+        return spotify_service.get_queue(args.get("limit", 10))
+
+    if name == "spotify_add_to_queue":
+        return spotify_service.add_to_queue(args.get("tracks") or [])
+
+    if name == "spotify_playlist_from_artists":
+        return spotify_service.playlist_from_artists(
+            args.get("artists") or [], args.get("name"), args.get("mix", True)
+        )
+
+    if name == "spotify_playlist_from_tracks":
+        return spotify_service.playlist_from_tracks(
+            args.get("tracks") or [], args.get("name")
+        )
+
+    if name == "spotify_add_to_playlist":
+        return spotify_service.add_tracks_to_existing_playlist(
+            args.get("playlist_name", ""), args.get("tracks") or []
+        )
+
+    if name == "spotify_similar_artists":
+        return spotify_service.similar_artists(
+            args.get("seed_artist", ""),
+            args.get("candidate_artists") or [],
+            args.get("artist_count", 5),
+            args.get("tracks_per_artist", 2),
+            args.get("only_new", True),
+            args.get("create_playlist", False),
+            args.get("playlist_name"),
+        )
+
+    if name == "spotify_playlist_from_liked":
+        return spotify_service.playlist_from_liked(
+            name=args.get("name"),
+            track_count=args.get("track_count", 30),
+            genres=args.get("genres") or [],
+            domestic=args.get("domestic", "any"),
+            artists=args.get("artists"),
+            mode=args.get("mode", "mixed"),
+            avoid_recent_days=args.get("avoid_recent_days"),
+            max_per_artist=args.get("max_per_artist", 3),
+        )
+
+    if name == "spotify_top":
+        top = (
+            spotify_service.top_artists
+            if args.get("kind") == "artists"
+            else spotify_service.top_tracks
+        )
+        return top(args.get("time_range", "short_term"), args.get("limit", 10))
+
+    if name == "spotify_list_liked":
+        return spotify_service.list_liked(args.get("limit", 20))
+
+    if name == "spotify_history_list":
+        return spotify_service.history_list(
+            args.get("start_date"),
+            args.get("end_date"),
+            args.get("limit", 50),
+            args.get("create_playlist", False),
+            args.get("playlist_name"),
+        )
+
+    if name == "spotify_history_stats":
+        return spotify_service.history_stats(
+            args.get("start_date"),
+            args.get("end_date"),
+            args.get("limit", 10),
+            args.get("group_by", "track"),
+        )
+
+    return "Nepoznat Spotify alat."
+
+
 def execute_tool(name, args, user_id=None):
 
     if name == "tasks_get_due":
@@ -4083,210 +1546,8 @@ def execute_tool(name, args, user_id=None):
             args.get("event_id", ""), args.get("calendar_id")
         )
 
-    if name == "spotify_current_track":
-
-        return spotify_current_track()
-
-    if name == "spotify_search_and_play":
-
-        return spotify_search_and_play(
-            args.get("query", "")
-        )
-
-    if name == "spotify_get_queue":
-
-        return spotify_get_queue(
-            args.get("limit", 10)
-        )
-
-    if name == "spotify_add_to_queue":
-
-        return spotify_add_to_queue(
-            args.get("query", "")
-        )
-
-    if name == "spotify_top_tracks":
-
-        return spotify_top_tracks(
-            args.get(
-                "time_range",
-                "medium_term"
-            ),
-            args.get(
-                "limit",
-                10
-            ),
-        )
-
-    if name == "spotify_top_artists":
-
-        return spotify_top_artists(
-            args.get(
-                "time_range",
-                "medium_term"
-            ),
-            args.get(
-                "limit",
-                10
-            ),
-        )
-
-    if name == "spotify_list_liked":
-
-        return spotify_list_liked(
-            args.get(
-                "limit",
-                20
-            )
-        )
-
-    if name == "spotify_history_stats":
-
-        return spotify_history_stats(
-            args.get("start_date"),
-            args.get("end_date"),
-            args.get("limit", 10),
-        )
-
-    if name == "spotify_history_list":
-
-        return spotify_history_list(
-            args.get("start_date"),
-            args.get("end_date"),
-            args.get("limit", 50),
-            args.get("create_playlist", False),
-            args.get("playlist_name"),
-        )
-
-    # -----------------------------------------------------
-    # DISCOVERY V2
-    # -----------------------------------------------------
-
-    if name == "spotify_discover_artists_v2":
-
-        return spotify_discover_artists_v2(
-
-            seed_artist=args.get(
-                "seed_artist",
-                ""
-            ),
-
-            candidate_artists=args.get(
-                "candidate_artists",
-                []
-            ),
-
-            artist_count=args.get(
-                "artist_count",
-                5
-            ),
-
-            tracks_per_artist=args.get(
-                "tracks_per_artist",
-                2
-            ),
-
-            exclude_favorites=args.get(
-                "exclude_favorites",
-                True
-            ),
-
-            exclude_top_artists=args.get(
-                "exclude_top_artists",
-                True
-            ),
-
-            min_liked_tracks_to_exclude=args.get(
-                "min_liked_tracks_to_exclude",
-                DISCOVERY_LIKED_THRESHOLD
-            ),
-
-            create_discovery_playlist=args.get(
-                "create_discovery_playlist",
-                False
-            ),
-
-            playlist_name=args.get(
-                "playlist_name"
-            ),
-        )
-
-    # -----------------------------------------------------
-    # SMART PLAYLIST V3
-    # -----------------------------------------------------
-
-    if name == "spotify_create_smart_playlist_v3":
-
-        return spotify_create_smart_playlist_v3(
-
-            name=args.get(
-                "name",
-                "AI Smart Playlist"
-            ),
-
-            max_tracks=args.get(
-                "max_tracks",
-                30
-            ),
-
-            genres=args.get(
-                "genres",
-                []
-            ),
-
-            domestic_weight=args.get(
-                "domestic_weight",
-                0
-            ),
-
-            domestic_required=args.get(
-                "domestic_required",
-                False
-            ),
-
-            favorite_weight=args.get(
-                "favorite_weight",
-                0
-            ),
-
-            forgotten_weight=args.get(
-                "forgotten_weight",
-                0
-            ),
-
-            avoid_recent_days=args.get(
-                "avoid_recent_days"
-            ),
-
-            recent_penalty=args.get(
-                "recent_penalty",
-                0
-            ),
-
-            max_recent_plays=args.get(
-                "max_recent_plays"
-            ),
-
-            recent_period_days=args.get(
-                "recent_period_days",
-                30
-            ),
-
-            max_per_artist=args.get(
-                "max_per_artist",
-                2
-            ),
-
-            avoid_consecutive_artist=args.get(
-                "avoid_consecutive_artist",
-                True
-            ),
-
-            randomness=args.get(
-                "randomness",
-                1.0
-            ),
-        )
+    if name.startswith("spotify_"):
+        return execute_spotify_tool(name, args)
 
     return "Nepoznat alat."
 
@@ -4406,10 +1667,7 @@ async def rijeka_news_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def history_sync_job(context: ContextTypes.DEFAULT_TYPE):
-    global LAST_HISTORY_SYNC
-
-    result = await asyncio.to_thread(spotify_sync_history)
-    LAST_HISTORY_SYNC = datetime.now(timezone.utc)
+    result = await asyncio.to_thread(spotify_service.sync_history)
     print("SPOTIFY HISTORY:", result)
 
 
@@ -4570,29 +1828,19 @@ async def start(
         "Primjeri:\n\n"
 
         "• Pusti A Forest od The Cure\n"
-        "• Pauziraj\n"
-        "• Glasnoća 30%\n"
-        "• Dodaj London Calling u queue\n"
+        "• pauza / dalje / glasnoća 30\n"
+        "• Stavi u red London Calling i Rudie Can't Fail\n"
         "• Top 10 pjesama zadnjih mjesec dana\n"
-        "• Što sam slušao jučer?\n"
-        "• Napravi playlistu od onog što sam slušao jučer\n\n"
+        "• Što sam slušao jučer?\n\n"
 
-        "Discovery:\n\n"
-
-        "• Daj mi 5 bendova sličnih Fontaines D.C. "
-        "koje nemam među favoritima i 2 pjesme svakog\n\n"
-
-        "• Daj mi 8 bendova kao IDLES koje ne slušam\n\n"
-
-        "• Napravi discovery playlistu s bendovima "
-        "sličnim Joy Divisionu koje nemam među favoritima, "
-        "2 pjesme po bendu\n\n"
-
-        "Smart Playlist:\n\n"
-
-        "• Napravi 40 mojih Liked Songs, uglavnom punk, "
-        "malo post-punka, preferiraj domaće i izbjegni "
-        "ono što sam slušao zadnjih 30 dana\n\n"
+        "Playliste:\n\n"
+        "• Napravi playlistu od 20 pjesama Fontaines D.C.\n"
+        "• Playlista: Majke i KUD Idijoti, po 10 pjesama\n"
+        "• Napravi playlistu od ovih pjesama: ...\n"
+        "• Napravi playlistu od onog što sam slušao jučer\n"
+        "• 5 bendova sličnih IDLES koje ne slušam, 2 pjesme svakog, kao playlistu\n"
+        "• 40 mojih Liked Songs, uglavnom punk, malo post-punka, "
+        "preferiraj domaće, bez onog što sam slušao zadnjih 30 dana\n\n"
 
         "Google Calendar:\n\n"
         "• /googleauth za prijavu u Google račun\n"
@@ -4829,7 +2077,7 @@ async def sync_spotify(
 ):
 
     await update.message.reply_text(
-        spotify_sync_history()
+        await asyncio.to_thread(spotify_service.sync_history)
     )
 
 
@@ -4854,7 +2102,7 @@ async def chat(
     try:
 
         await asyncio.to_thread(
-            sync_history_if_needed
+            spotify_service.sync_history_if_needed
         )
 
     except Exception:
@@ -4908,18 +2156,23 @@ async def chat(
         model_name
     )
 
+    # Responses API ne prenosi instructions kroz previous_response_id, pa se
+    # isti prompt šalje u svakom koraku; inače model nakon prvog alata
+    # zaboravi pravila (npr. da za Spotify ne traži potvrdu).
+    instructions = (
+        SYSTEM_PROMPT
+        + "\nTrenutni lokalni datum i vrijeme: "
+        + datetime.now(ZoneInfo(calendar_service.TIME_ZONE)).isoformat()
+        + "\n\nTrajna memorija korisnika:\n"
+        + get_relevant_user_memory_context(user_id, user_message)
+    )
+
     try:
 
         response = await asyncio.to_thread(
             client.responses.create,
             model=model_name,
-            instructions=(
-                SYSTEM_PROMPT
-                + "\nTrenutni lokalni datum i vrijeme: "
-                + datetime.now(ZoneInfo(calendar_service.TIME_ZONE)).isoformat()
-                + "\n\nTrajna memorija korisnika:\n"
-                + get_relevant_user_memory_context(user_id, user_message)
-            ),
+            instructions=instructions,
             input=messages,
             tools=TOOLS,
         )
@@ -5023,17 +2276,7 @@ async def chat(
                 previous_response_id=response.id,
                 input=tool_results,
                 tools=TOOLS,
-                instructions=(
-                    "Odgovori kratko i prirodno na hrvatskom. "
-                    "Ne izmišljaj rezultat. "
-                    "Trenutni lokalni datum i vrijeme je "
-                    + datetime.now(ZoneInfo(calendar_service.TIME_ZONE)).isoformat()
-                    + ".\n\nTrajna memorija korisnika:\n"
-                    + get_relevant_user_memory_context(user_id, user_message)
-                    + "\n"
-                    "Ako je discovery alat izbacio poznate "
-                    "izvođače, nemoj ih ponovno preporučiti."
-                ),
+                instructions=instructions,
             )
 
         answer = response.output_text
@@ -5097,7 +2340,7 @@ def main():
     try:
 
         print(
-            spotify_sync_history()
+            spotify_service.sync_history()
         )
 
     except Exception as e:
@@ -5297,7 +2540,7 @@ def main():
     )
 
     print(
-        "Osobni AI agent za Spotify i Google Calendar radi..."
+        "Pero AI radi..."
     )
 
     app.run_polling()
