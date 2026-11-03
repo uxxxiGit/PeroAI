@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from googleapiclient.discovery import build
@@ -80,13 +80,15 @@ def _local_due_date(value):
     return datetime.fromisoformat(value.replace("Z", "+00:00")).date()
 
 
-def get_due_tasks(today=None):
+def get_due_tasks(today=None, upcoming_days=7):
     local_zone = ZoneInfo(calendar_service.TIME_ZONE)
     today = today or datetime.now(local_zone).date()
+    upcoming_until = today + timedelta(days=upcoming_days)
     service = _service()
     lists = service.tasklists().list(maxResults=100).execute().get("items", [])
     overdue = []
     due_today = []
+    upcoming = []
     without_due = []
 
     for task_list in lists:
@@ -118,6 +120,8 @@ def get_due_tasks(today=None):
                     overdue.append(item)
                 elif due_date == today:
                     due_today.append(item)
+                elif due_date <= upcoming_until:
+                    upcoming.append(item)
 
             page_token = response.get("nextPageToken")
             if not page_token:
@@ -125,10 +129,12 @@ def get_due_tasks(today=None):
 
     overdue.sort(key=lambda item: (item["due"], item["title"]))
     due_today.sort(key=lambda item: item["title"])
+    upcoming.sort(key=lambda item: (item["due"], item["title"]))
     without_due.sort(key=lambda item: (item["task_list"], item["title"]))
     return {
         "overdue": overdue,
         "today": due_today,
+        "upcoming": upcoming,
         "without_due": without_due,
     }
 

@@ -1620,6 +1620,17 @@ def build_morning_report():
     else:
         lines.append("• Nema zakašnjelih zadataka.")
 
+    if tasks.get("upcoming"):
+        lines.extend(["", "Uskoro (7 dana):"])
+        for task in tasks["upcoming"]:
+            due = datetime.fromisoformat(task["due"]).strftime("%d.%m.")
+            lines.append(f"• {due} {task['title']} ({task['task_list']})")
+
+    if tasks.get("without_due"):
+        lines.extend(["", "Zadaci bez roka:"])
+        for task in tasks["without_due"]:
+            lines.append(f"• {task['title']} ({task['task_list']})")
+
     return "\n".join(lines)
 
 
