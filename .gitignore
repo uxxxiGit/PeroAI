@@ -14,3 +14,4 @@ memory.db
 Backup/
 Backup2/
 *.zip
+bot.lock

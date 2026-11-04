@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from openai import OpenAI
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import Conflict
 from telegram.ext import (
     ApplicationBuilder,
     ApplicationHandlerStop,
@@ -42,7 +43,7 @@ TELEGRAM_ALLOWED_USER_ID = os.getenv("TELEGRAM_ALLOWED_USER_ID", "").strip()
 # =========================================================
 
 DB_FILE = "memory.db"
-BOT_VERSION = "2026.11.03-spotify-v11"
+BOT_VERSION = "2026.11.04-single-v12"
 
 # Kratka neposredna povijest. Trajna memorija se dohvaća odvojeno i samo kada
 # je povezana s aktualnim pitanjem, kako se nepotrebno ne troše tokeni.
@@ -1631,6 +1632,9 @@ def build_morning_report():
         for task in tasks["without_due"]:
             lines.append(f"• {task['title']} ({task['task_list']})")
 
+    # Verzija pomaže prepoznati koja je instanca bota poslala izvještaj.
+    lines.extend(["", f"Pero AI {BOT_VERSION}"])
+
     return "\n".join(lines)
 
 
@@ -2341,7 +2345,48 @@ async def reject_unknown_user(
 # MAIN
 # =========================================================
 
+LOCK_FILE = "bot.lock"
+
+
+def acquire_single_instance_lock():
+
+    # Svaka pokrenuta instanca ima vlastiti JobQueue, pa bi dvije instance
+    # poslale dva jutarnja izvještaja. Zaključana datoteka ostaje zauzeta
+    # dok proces radi i oslobađa se sama kad se proces zatvori.
+    lock = open(LOCK_FILE, "a+")
+
+    try:
+        if os.name == "nt":
+            import msvcrt
+            lock.seek(0)
+            msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        raise SystemExit(
+            "Pero AI već radi na ovom računalu. Zatvori postojeći prozor "
+            "bota (Ctrl+C) prije novog pokretanja."
+        )
+
+    return lock
+
+
+async def handle_error(update, context: ContextTypes.DEFAULT_TYPE):
+
+    if isinstance(context.error, Conflict):
+        print(
+            "UPOZORENJE: isti Telegram bot radi još negdje (drugi prozor ili "
+            "drugo računalo). Ostavi pokrenutu samo jednu instancu."
+        )
+        return
+
+    print("TELEGRAM GREŠKA:", repr(context.error))
+
+
 def main():
+
+    instance_lock = acquire_single_instance_lock()
 
     init_database()
 
@@ -2554,7 +2599,11 @@ def main():
         "Pero AI radi..."
     )
 
+    app.add_error_handler(handle_error)
+
     app.run_polling()
+
+    instance_lock.close()
 
 
 if __name__ == "__main__":
