@@ -79,8 +79,9 @@ Tajne (`.env`, tokeni, `memory.db`, `Backup*/`, `*.zip`, `bot.lock`) su u
 
 ## Otvoreno
 
-- Commit s `bot.lock` / verzijom `2026.11.04-single-v12` još nije napravljen
-  (na kraju sesije).
+- Verzija `2026.11.04-single-v12` je na GitHubu (commit `24d2ec5`), ali je
+  drugo računalo na kojem bot radi treba preuzeti (`git pull` ili kopija)
+  i ponovno pokrenuti.
 - Utvrditi što na drugom računalu pokreće bota (roditeljski proces 13864,
   zakazani zadatak?) da se izbjegne dvostruko pokretanje.
 - U trajnoj memoriji ostale su bilješke o playlisti "laganitza"
